@@ -18,8 +18,12 @@ func NewINode() BTreeInternalNode {
 
 // FindLastLE returns the last index whose key is at most findKey, or -1.
 func (node *BTreeInternalNode) FindLastLE(findKey int32) int {
-	for i := node.nkey - 1; i >= 0; i-- {
-		if node.keys[i] <= findKey {
+	return findLastLE(node.keys[:node.nkey], findKey)
+}
+
+func findLastLE(keys []int32, findKey int32) int {
+	for i := len(keys) - 1; i >= 0; i-- {
+		if keys[i] <= findKey {
 			return i
 		}
 	}
@@ -28,11 +32,14 @@ func (node *BTreeInternalNode) FindLastLE(findKey int32) int {
 
 // InsertKV inserts a key and its child in sorted order. The node must have room.
 func (node *BTreeInternalNode) InsertKV(key int32, child Node) {
+	node.insertAt(node.FindLastLE(key)+1, key, child)
+}
+
+func (node *BTreeInternalNode) insertAt(pos int, key int32, child Node) {
 	if node.nkey == len(node.keys) {
 		panic("cannot insert into a full internal node")
 	}
 
-	pos := node.FindLastLE(key) + 1
 	for i := node.nkey; i > pos; i-- {
 		node.keys[i] = node.keys[i-1]
 		node.child[i] = node.child[i-1]
