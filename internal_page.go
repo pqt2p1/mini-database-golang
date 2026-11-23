@@ -70,10 +70,13 @@ func (page *BTreeInternalPage) FindLastLE(findKey KeyEntry) int {
 
 // InsertKV inserts a key and its child page offset. The page must have room.
 func (page *BTreeInternalPage) InsertKV(key KeyEntry, child uint64) {
+	page.insertAt(page.FindLastLE(key)+1, key, child)
+}
+
+func (page *BTreeInternalPage) insertAt(pos int, key KeyEntry, child uint64) {
 	if int(page.nkey) == len(page.keys) {
 		panic("cannot insert into a full internal page")
 	}
-	pos := page.FindLastLE(key) + 1
 	for i := int(page.nkey); i > pos; i-- {
 		page.keys[i] = page.keys[i-1]
 		page.children[i] = page.children[i-1]

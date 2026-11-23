@@ -91,18 +91,18 @@ func TestInternalPageBinaryFormat(t *testing.T) {
 }
 
 func TestMetaPageBinaryFormat(t *testing.T) {
-	tree := NewBPTreeDisk()
-	encoded, err := tree.head.MarshalBinary()
+	var page MetaPage
+	encoded, err := page.MarshalBinary()
 	if err != nil || !bytes.Equal(encoded, make([]byte, pageHeaderSize)) {
 		t.Fatalf("empty tree header = %x, err = %v", encoded, err)
 	}
-	tree.head.header.nextPage = 4096
-	encoded, err = tree.head.MarshalBinary()
+	page.header.nextPage = 4096
+	encoded, err = page.MarshalBinary()
 	if err != nil {
 		t.Fatal(err)
 	}
 	var decoded MetaPage
-	if err := decoded.UnmarshalBinary(encoded); err != nil || decoded != tree.head {
+	if err := decoded.UnmarshalBinary(encoded); err != nil || decoded != page {
 		t.Fatalf("meta page did not round trip: %v", err)
 	}
 }
