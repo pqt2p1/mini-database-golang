@@ -23,6 +23,15 @@ func NewKeyValFromInt(key, value int64) KeyVal {
 	return entry
 }
 
+func newKeyValFromBytes(key KeyEntry, value []byte) (KeyVal, error) {
+	if len(value) > maxValueSize {
+		return KeyVal{}, fmt.Errorf("value length %d exceeds %d bytes", len(value), maxValueSize)
+	}
+	entry := KeyVal{key: key, valueLength: uint16(len(value))}
+	copy(entry.value[maxValueSize-len(value):], value)
+	return entry, nil
+}
+
 type BTreeLeafPage struct {
 	header PageHeader
 	nkv    uint16
@@ -43,13 +52,22 @@ func (page *BTreeLeafPage) FindLastLE(key KeyEntry) int {
 }
 
 func (page *BTreeLeafPage) InsertKV(entry KeyVal) {
+	page.insertAt(page.FindLastLE(entry.key)+1, entry)
+}
+
+func (page *BTreeLeafPage) insertAt(pos int, entry KeyVal) {
 	if int(page.nkv) == len(page.kv) {
 		panic("cannot insert into a full leaf page")
 	}
-	pos := page.FindLastLE(entry.key) + 1
 	copy(page.kv[pos+1:], page.kv[pos:page.nkv])
 	page.kv[pos] = entry
 	page.nkv++
+}
+
+func (page *BTreeLeafPage) deleteAt(pos int) {
+	copy(page.kv[pos:], page.kv[pos+1:page.nkv])
+	page.nkv--
+	page.kv[page.nkv] = KeyVal{}
 }
 
 func (page *BTreeLeafPage) Split() BTreeLeafPage {

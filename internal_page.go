@@ -24,11 +24,23 @@ func NewKeyEntryFromInt(key int64) KeyEntry {
 	return entry
 }
 
+func NewKeyEntryFromBytes(data []byte) (KeyEntry, error) {
+	if len(data) > maxKeySize {
+		return KeyEntry{}, fmt.Errorf("key length %d exceeds %d bytes", len(data), maxKeySize)
+	}
+	key := KeyEntry{length: uint16(len(data))}
+	copy(key.data[maxKeySize-len(data):], data)
+	return key, nil
+}
+
 func (key KeyEntry) compare(other KeyEntry) int {
-	// The signed comparison keeps integer keys in the same order as the in-memory tree.
+	// Preserve the order of existing integer keys and distinguish leading zero bytes.
 	left := int64(binary.BigEndian.Uint64(key.data[:]))
 	right := int64(binary.BigEndian.Uint64(other.data[:]))
-	return cmp.Compare(left, right)
+	if order := cmp.Compare(left, right); order != 0 {
+		return order
+	}
+	return cmp.Compare(key.length, other.length)
 }
 
 func readKeyEntry(src []byte) (KeyEntry, []byte, error) {
@@ -84,6 +96,14 @@ func (page *BTreeInternalPage) insertAt(pos int, key KeyEntry, child uint64) {
 	page.keys[pos] = key
 	page.children[pos] = child
 	page.nkey++
+}
+
+func (page *BTreeInternalPage) deleteAt(pos int) {
+	copy(page.keys[pos:], page.keys[pos+1:page.nkey])
+	copy(page.children[pos:], page.children[pos+1:page.nkey])
+	page.nkey--
+	page.keys[page.nkey] = KeyEntry{}
+	page.children[page.nkey] = 0
 }
 
 // Split keeps the left half in page and returns a new internal page for the right half.

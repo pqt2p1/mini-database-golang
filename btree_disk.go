@@ -3,6 +3,7 @@ package main
 import (
 	"encoding"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -60,7 +61,7 @@ func (page *MetaPage) UnmarshalBinary(src []byte) error {
 
 type BPTreeDisk struct {
 	fileName string
-	mu       sync.Mutex
+	mu       sync.RWMutex
 }
 
 // NewBPTreeDisk creates a handle for a file. Use one writer handle per file.
@@ -70,55 +71,163 @@ func NewBPTreeDisk(fileName string) *BPTreeDisk {
 
 // Insert adds a key-value pair, retaining duplicate keys in insertion order.
 func (tree *BPTreeDisk) Insert(key, value int64) error {
-	tree.mu.Lock()
-	defer tree.mu.Unlock()
+	_, err := tree.change(NewKeyValFromInt(key, value), insertRecord)
+	return err
+}
 
-	file, err := os.OpenFile(tree.fileName, os.O_RDWR|os.O_CREATE, 0o644)
+// Set inserts a key-value pair or replaces the most recent record for that key.
+func (tree *BPTreeDisk) Set(key, value []byte) error {
+	encodedKey, err := NewKeyEntryFromBytes(key)
 	if err != nil {
 		return err
+	}
+	entry, err := newKeyValFromBytes(encodedKey, value)
+	if err != nil {
+		return err
+	}
+	_, err = tree.change(entry, setRecord)
+	return err
+}
+
+// Del removes the most recent record for key and reports whether it existed.
+func (tree *BPTreeDisk) Del(key []byte) (bool, error) {
+	encodedKey, err := NewKeyEntryFromBytes(key)
+	if err != nil {
+		return false, err
+	}
+	return tree.change(KeyVal{key: encodedKey}, deleteRecord)
+}
+
+// Find returns the most recent record for key.
+func (tree *BPTreeDisk) Find(key []byte) (KeyVal, bool, error) {
+	encodedKey, err := NewKeyEntryFromBytes(key)
+	if err != nil {
+		return KeyVal{}, false, err
+	}
+	tree.mu.RLock()
+	defer tree.mu.RUnlock()
+	file, err := os.Open(tree.fileName)
+	if errors.Is(err, os.ErrNotExist) {
+		return KeyVal{}, false, nil
+	}
+	if err != nil {
+		return KeyVal{}, false, err
 	}
 	defer file.Close()
 
-	info, err := file.Stat()
-	if err != nil {
-		return err
+	meta, _, err := loadDiskMeta(file)
+	offset := meta.header.nextPage
+	if err != nil || offset == 0 {
+		return KeyVal{}, false, err
 	}
-	var meta MetaPage
-	if info.Size() == 0 {
-		if _, err := file.WriteAt(make([]byte, diskPageSize), 0); err != nil {
-			return fmt.Errorf("initialize meta page: %w", err)
-		}
-	} else {
-		block, err := readDiskPage(file, 0)
+	block, err := readDiskPage(file, offset)
+	if err != nil {
+		return KeyVal{}, false, err
+	}
+	for {
+		page, err := decodeInternalPage(block[:], offset)
 		if err != nil {
-			return err
+			return KeyVal{}, false, err
 		}
-		if err := meta.UnmarshalBinary(block[:]); err != nil {
-			return fmt.Errorf("decode meta page: %w", err)
+		pos := page.FindLastLE(encodedKey)
+		if pos < 0 {
+			return KeyVal{}, false, nil
 		}
+		child := page.children[pos]
+		block, err = readDiskChild(file, offset, child)
+		if err != nil {
+			return KeyVal{}, false, err
+		}
+		if block[0] == leafPageType {
+			leaf, err := decodeLeafPage(block[:], child)
+			if err != nil {
+				return KeyVal{}, false, err
+			}
+			pos := leaf.FindLastLE(encodedKey)
+			if pos >= 0 && leaf.kv[pos].key == encodedKey {
+				return leaf.kv[pos], true, nil
+			}
+			return KeyVal{}, false, nil
+		}
+		offset = child
+	}
+}
+
+type recordChange uint8
+
+const (
+	insertRecord recordChange = iota
+	setRecord
+	deleteRecord
+)
+
+func (tree *BPTreeDisk) change(entry KeyVal, change recordChange) (bool, error) {
+	tree.mu.Lock()
+	defer tree.mu.Unlock()
+
+	flags := os.O_RDWR
+	if change != deleteRecord {
+		flags |= os.O_CREATE
+	}
+	file, err := os.OpenFile(tree.fileName, flags, 0o644)
+	if change == deleteRecord && errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	defer file.Close()
+
+	meta, size, err := loadDiskMeta(file)
+	if err != nil {
+		return false, err
+	}
+	if meta.header.nextPage == 0 && change == deleteRecord {
+		return false, nil
+	}
+	if size == 0 {
+		if _, err := file.WriteAt(make([]byte, diskPageSize), 0); err != nil {
+			return false, fmt.Errorf("initialize meta page: %w", err)
+		}
+		size = diskPageSize
 	}
 
 	// Pages are appended so a failed write to the new path leaves the existing path intact.
 	// Round up past any partial page left by a failed append.
-	size := max(uint64(info.Size()), uint64(diskPageSize))
 	nextOffset := (size + diskPageSize - 1) / diskPageSize * diskPageSize
 	writer := diskPageWriter{file: file, nextOffset: nextOffset}
-	root, err := writer.insert(meta.header.nextPage, uint64(info.Size()), NewKeyValFromInt(key, value))
-	if err != nil {
-		return err
+	root, changed, err := writer.changeRoot(meta.header.nextPage, entry, change)
+	if err != nil || !changed {
+		return false, err
 	}
 	if err := file.Sync(); err != nil {
-		return fmt.Errorf("sync new pages: %w", err)
+		return false, fmt.Errorf("sync new pages: %w", err)
 	}
 	meta.header.nextPage = root
 	encoded := meta.header.appendBinary(nil)
 	if _, err := file.WriteAt(encoded, 0); err != nil {
-		return fmt.Errorf("update root offset: %w", err)
+		return false, fmt.Errorf("update root offset: %w", err)
 	}
 	if err := file.Sync(); err != nil {
-		return fmt.Errorf("sync root offset: %w", err)
+		return false, fmt.Errorf("sync root offset: %w", err)
 	}
-	return nil
+	return true, nil
+}
+
+func loadDiskMeta(file *os.File) (MetaPage, uint64, error) {
+	var meta MetaPage
+	info, err := file.Stat()
+	if err != nil || info.Size() == 0 {
+		return meta, 0, err
+	}
+	block, err := readDiskPage(file, 0)
+	if err != nil {
+		return meta, 0, err
+	}
+	if err := meta.UnmarshalBinary(block[:]); err != nil {
+		return meta, 0, fmt.Errorf("decode meta page: %w", err)
+	}
+	return meta, uint64(info.Size()), nil
 }
 
 func readDiskPage(file *os.File, offset uint64) ([diskPageSize]byte, error) {
@@ -132,6 +241,13 @@ func readDiskPage(file *os.File, offset uint64) ([diskPageSize]byte, error) {
 	return block, nil
 }
 
+func readDiskChild(file *os.File, parent, child uint64) ([diskPageSize]byte, error) {
+	if child == 0 || child >= parent {
+		return [diskPageSize]byte{}, fmt.Errorf("invalid child offset %d in page %d", child, parent)
+	}
+	return readDiskPage(file, child)
+}
+
 type diskPageWriter struct {
 	file       *os.File
 	nextOffset uint64
@@ -140,6 +256,11 @@ type diskPageWriter struct {
 type pageLink struct {
 	key    KeyEntry
 	offset uint64
+}
+
+type pageChange struct {
+	left, right pageLink
+	changed     bool
 }
 
 func (writer *diskPageWriter) appendPage(page encoding.BinaryMarshaler, firstKey KeyEntry) (pageLink, error) {
@@ -160,98 +281,136 @@ func (writer *diskPageWriter) appendPage(page encoding.BinaryMarshaler, firstKey
 	return pageLink{key: firstKey, offset: offset}, nil
 }
 
-func (writer *diskPageWriter) insert(rootOffset, fileSize uint64, entry KeyVal) (uint64, error) {
+func (writer *diskPageWriter) changeRoot(rootOffset uint64, entry KeyVal, change recordChange) (uint64, bool, error) {
 	if rootOffset == 0 {
 		leaf := NewLPage()
 		leaf.InsertKV(entry)
 		child, err := writer.appendPage(leaf, entry.key)
 		if err != nil {
-			return 0, err
+			return 0, false, err
 		}
 		root := NewIPage()
 		root.InsertKV(child.key, child.offset)
 		link, err := writer.appendPage(root, child.key)
-		return link.offset, err
+		return link.offset, err == nil, err
 	}
 
-	if rootOffset >= fileSize {
-		return 0, fmt.Errorf("root page offset %d is outside the file", rootOffset)
-	}
 	block, err := readDiskPage(writer.file, rootOffset)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
-	left, right, err := writer.insertInternal(rootOffset, block[:], entry)
-	if err != nil || right.offset == 0 {
-		return left.offset, err
+	result, err := writer.changeInternal(rootOffset, block[:], entry, change)
+	if err != nil || result.right.offset == 0 {
+		return result.left.offset, result.changed, err
 	}
 	root := NewIPage()
-	root.InsertKV(left.key, left.offset)
-	root.InsertKV(right.key, right.offset)
-	link, err := writer.appendPage(root, left.key)
-	return link.offset, err
+	root.InsertKV(result.left.key, result.left.offset)
+	root.InsertKV(result.right.key, result.right.offset)
+	link, err := writer.appendPage(root, result.left.key)
+	return link.offset, err == nil, err
 }
 
-func (writer *diskPageWriter) insertInternal(offset uint64, block []byte, entry KeyVal) (left, right pageLink, err error) {
+func decodeInternalPage(block []byte, offset uint64) (BTreeInternalPage, error) {
 	var page BTreeInternalPage
 	if err := page.UnmarshalBinary(block); err != nil {
-		return pageLink{}, pageLink{}, fmt.Errorf("decode internal page at %d: %w", offset, err)
+		return BTreeInternalPage{}, fmt.Errorf("decode internal page at %d: %w", offset, err)
 	}
 	if page.nkey == 0 || int(page.nkey) >= len(page.keys) {
-		return pageLink{}, pageLink{}, fmt.Errorf("invalid child count %d at offset %d", page.nkey, offset)
+		return BTreeInternalPage{}, fmt.Errorf("invalid child count %d at offset %d", page.nkey, offset)
 	}
-	pos := max(0, page.FindLastLE(entry.key))
-	child := page.children[pos]
-	if child == 0 || child >= offset {
-		return pageLink{}, pageLink{}, fmt.Errorf("invalid child offset %d in page %d", child, offset)
-	}
-	childBlock, err := readDiskPage(writer.file, child)
-	if err != nil {
-		return pageLink{}, pageLink{}, err
-	}
-	var childLeft, childRight pageLink
-	switch childBlock[0] {
-	case internalPageType:
-		childLeft, childRight, err = writer.insertInternal(child, childBlock[:], entry)
-	case leafPageType:
-		childLeft, childRight, err = writer.insertLeaf(child, childBlock[:], entry)
-	default:
-		return pageLink{}, pageLink{}, fmt.Errorf("unexpected page type %d at offset %d", childBlock[0], child)
-	}
-	if err != nil {
-		return pageLink{}, pageLink{}, err
-	}
-	page.keys[pos], page.children[pos] = childLeft.key, childLeft.offset
-	if childRight.offset != 0 {
-		page.insertAt(pos+1, childRight.key, childRight.offset)
-	}
-	if int(page.nkey) == len(page.keys) {
-		sibling := page.Split()
-		right, err = writer.appendPage(sibling, sibling.keys[0])
-		if err != nil {
-			return pageLink{}, pageLink{}, err
-		}
-	}
-	left, err = writer.appendPage(page, page.keys[0])
-	return left, right, err
+	return page, nil
 }
 
-func (writer *diskPageWriter) insertLeaf(offset uint64, block []byte, entry KeyVal) (left, right pageLink, err error) {
-	var page BTreeLeafPage
-	if err := page.UnmarshalBinary(block); err != nil {
-		return pageLink{}, pageLink{}, fmt.Errorf("decode leaf page at %d: %w", offset, err)
+func (writer *diskPageWriter) changeInternal(offset uint64, block []byte, entry KeyVal, change recordChange) (pageChange, error) {
+	page, err := decodeInternalPage(block, offset)
+	if err != nil {
+		return pageChange{}, err
 	}
-	if page.nkv == 0 || int(page.nkv) >= len(page.kv) {
-		return pageLink{}, pageLink{}, fmt.Errorf("invalid record count %d at offset %d", page.nkv, offset)
+	pos := page.FindLastLE(entry.key)
+	if pos < 0 && change == deleteRecord {
+		return pageChange{}, nil
 	}
-	page.InsertKV(entry)
-	if int(page.nkv) == len(page.kv) {
-		sibling := page.Split()
-		right, err = writer.appendPage(sibling, sibling.kv[0].key)
-		if err != nil {
-			return pageLink{}, pageLink{}, err
+	pos = max(0, pos)
+	child := page.children[pos]
+	childBlock, err := readDiskChild(writer.file, offset, child)
+	if err != nil {
+		return pageChange{}, err
+	}
+	var result pageChange
+	switch childBlock[0] {
+	case internalPageType:
+		result, err = writer.changeInternal(child, childBlock[:], entry, change)
+	case leafPageType:
+		result, err = writer.changeLeaf(child, childBlock[:], entry, change)
+	default:
+		return pageChange{}, fmt.Errorf("unexpected page type %d at offset %d", childBlock[0], child)
+	}
+	if err != nil || !result.changed {
+		return pageChange{}, err
+	}
+	if result.left.offset == 0 {
+		page.deleteAt(pos)
+		if page.nkey == 0 {
+			return pageChange{changed: true}, nil
+		}
+	} else {
+		page.keys[pos], page.children[pos] = result.left.key, result.left.offset
+		if result.right.offset != 0 {
+			page.insertAt(pos+1, result.right.key, result.right.offset)
 		}
 	}
-	left, err = writer.appendPage(page, page.kv[0].key)
-	return left, right, err
+	updated := pageChange{changed: true}
+	if int(page.nkey) == len(page.keys) {
+		sibling := page.Split()
+		updated.right, err = writer.appendPage(sibling, sibling.keys[0])
+		if err != nil {
+			return pageChange{}, err
+		}
+	}
+	updated.left, err = writer.appendPage(page, page.keys[0])
+	return updated, err
+}
+
+func decodeLeafPage(block []byte, offset uint64) (BTreeLeafPage, error) {
+	var page BTreeLeafPage
+	if err := page.UnmarshalBinary(block); err != nil {
+		return BTreeLeafPage{}, fmt.Errorf("decode leaf page at %d: %w", offset, err)
+	}
+	if page.nkv == 0 || int(page.nkv) >= len(page.kv) {
+		return BTreeLeafPage{}, fmt.Errorf("invalid record count %d at offset %d", page.nkv, offset)
+	}
+	return page, nil
+}
+
+func (writer *diskPageWriter) changeLeaf(offset uint64, block []byte, entry KeyVal, change recordChange) (pageChange, error) {
+	page, err := decodeLeafPage(block, offset)
+	if err != nil {
+		return pageChange{}, err
+	}
+	pos := page.FindLastLE(entry.key)
+	found := pos >= 0 && page.kv[pos].key == entry.key
+	switch {
+	case change == deleteRecord:
+		if !found {
+			return pageChange{}, nil
+		}
+		page.deleteAt(pos)
+		if page.nkv == 0 {
+			return pageChange{changed: true}, nil
+		}
+	case change == setRecord && found:
+		page.kv[pos] = entry
+	default:
+		page.insertAt(pos+1, entry)
+	}
+	updated := pageChange{changed: true}
+	if int(page.nkv) == len(page.kv) {
+		sibling := page.Split()
+		updated.right, err = writer.appendPage(sibling, sibling.kv[0].key)
+		if err != nil {
+			return pageChange{}, err
+		}
+	}
+	updated.left, err = writer.appendPage(page, page.kv[0].key)
+	return updated, err
 }
