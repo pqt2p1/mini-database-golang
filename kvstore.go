@@ -2,7 +2,7 @@ package main
 
 import "bytes"
 
-// KV provides a persistent key-value store for byte slices up to eight bytes each.
+// KV provides a persistent store for keys up to 8 bytes and values up to 32 bytes.
 type KV struct {
 	tree *BPTreeDisk
 }

@@ -80,7 +80,7 @@ func TestInternalPageBinaryFormat(t *testing.T) {
 		value byte
 	}{
 		{0, leafPageType},
-		{pageHeaderSize + 1, INTERNAL_MAX_KEY + 1},
+		{pageHeaderSize + 1, internalPageMaxKeys + 1},
 		{pageHeaderSize + uint16Size + 1, maxKeySize + 1},
 	} {
 		invalid := slices.Clone(wire)

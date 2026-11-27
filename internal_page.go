@@ -5,12 +5,15 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"sort"
 )
 
 const (
-	maxKeySize  = 8
-	uint16Size  = 2
-	pagePtrSize = 8
+	maxKeySize          = 8
+	uint16Size          = 2
+	pagePtrSize         = 8
+	internalRecordSize  = uint16Size + maxKeySize + pagePtrSize
+	internalPageMaxKeys = (diskPageSize - pageHeaderSize - uint16Size) / internalRecordSize
 )
 
 type KeyEntry struct {
@@ -63,8 +66,8 @@ func readKeyEntry(src []byte) (KeyEntry, []byte, error) {
 type BTreeInternalPage struct {
 	header   PageHeader
 	nkey     uint16
-	keys     [INTERNAL_MAX_KEY]KeyEntry
-	children [INTERNAL_MAX_KEY]uint64
+	keys     [internalPageMaxKeys]KeyEntry
+	children [internalPageMaxKeys]uint64
 }
 
 func NewIPage() BTreeInternalPage {
@@ -72,12 +75,9 @@ func NewIPage() BTreeInternalPage {
 }
 
 func (page *BTreeInternalPage) FindLastLE(findKey KeyEntry) int {
-	for i := int(page.nkey) - 1; i >= 0; i-- {
-		if page.keys[i].compare(findKey) <= 0 {
-			return i
-		}
-	}
-	return -1
+	return sort.Search(int(page.nkey), func(i int) bool {
+		return page.keys[i].compare(findKey) > 0
+	}) - 1
 }
 
 // InsertKV inserts a key and its child page offset. The page must have room.
@@ -130,7 +130,7 @@ func (page BTreeInternalPage) MarshalBinary() ([]byte, error) {
 	if int(page.nkey) > len(page.keys) {
 		return nil, fmt.Errorf("internal page key count %d exceeds %d", page.nkey, len(page.keys))
 	}
-	size := pageHeaderSize + uint16Size + int(page.nkey)*(uint16Size+maxKeySize+pagePtrSize)
+	size := pageHeaderSize + uint16Size + int(page.nkey)*internalRecordSize
 	dst := page.header.appendBinary(make([]byte, 0, size))
 	dst = binary.BigEndian.AppendUint16(dst, page.nkey)
 	for _, key := range page.keys[:page.nkey] {

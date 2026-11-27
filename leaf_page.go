@@ -4,11 +4,14 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"sort"
 )
 
 const (
-	leafMaxKV    = 4
-	maxValueSize = 8
+	maxValueSize   = 32
+	intValueSize   = 8
+	leafRecordSize = 2*uint16Size + maxKeySize + maxValueSize
+	leafMaxKV      = (diskPageSize - pageHeaderSize - uint16Size) / leafRecordSize
 )
 
 type KeyVal struct {
@@ -18,8 +21,8 @@ type KeyVal struct {
 }
 
 func NewKeyValFromInt(key, value int64) KeyVal {
-	entry := KeyVal{key: NewKeyEntryFromInt(key), valueLength: maxValueSize}
-	binary.BigEndian.PutUint64(entry.value[:], uint64(value))
+	entry := KeyVal{key: NewKeyEntryFromInt(key), valueLength: intValueSize}
+	binary.BigEndian.PutUint64(entry.value[maxValueSize-intValueSize:], uint64(value))
 	return entry
 }
 
@@ -43,12 +46,9 @@ func NewLPage() BTreeLeafPage {
 }
 
 func (page *BTreeLeafPage) FindLastLE(key KeyEntry) int {
-	for i := int(page.nkv) - 1; i >= 0; i-- {
-		if page.kv[i].key.compare(key) <= 0 {
-			return i
-		}
-	}
-	return -1
+	return sort.Search(int(page.nkv), func(i int) bool {
+		return page.kv[i].key.compare(key) > 0
+	}) - 1
 }
 
 func (page *BTreeLeafPage) InsertKV(entry KeyVal) {
@@ -85,7 +85,7 @@ func (page BTreeLeafPage) MarshalBinary() ([]byte, error) {
 	if page.header.pageType != leafPageType || int(page.nkv) > len(page.kv) {
 		return nil, fmt.Errorf("invalid leaf page type %d or record count %d", page.header.pageType, page.nkv)
 	}
-	size := pageHeaderSize + uint16Size + int(page.nkv)*(2*uint16Size+maxKeySize+maxValueSize)
+	size := pageHeaderSize + uint16Size + int(page.nkv)*leafRecordSize
 	dst := page.header.appendBinary(make([]byte, 0, size))
 	dst = binary.BigEndian.AppendUint16(dst, page.nkv)
 	for _, entry := range page.kv[:page.nkv] {
