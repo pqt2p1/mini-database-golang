@@ -60,7 +60,7 @@ func TestInternalPageBinaryFormat(t *testing.T) {
 		t.Fatal(err)
 	}
 	if decoded.header.nextPage != 8192 || decoded.nkey != 2 || decoded.keys[0] != NewKeyEntryFromInt(-2) ||
-		decoded.keys[1] != (KeyEntry{length: 1, data: [maxKeySize]byte{7: 5}}) ||
+		decoded.keys[1] != (KeyEntry{length: 1, data: [maxKeySize]byte{maxKeySize - 1: 5}}) ||
 		decoded.children[0] != 4096 || decoded.children[1] != 12288 {
 		t.Fatalf("decoded unexpected page: %+v", decoded)
 	}

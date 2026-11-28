@@ -10,7 +10,7 @@ import (
 const (
 	maxValueSize   = 32
 	intValueSize   = 8
-	leafRecordSize = 2*uint16Size + maxKeySize + maxValueSize
+	leafRecordSize = 2*uint16Size + intKeySize + maxValueSize
 	leafMaxKV      = (diskPageSize - pageHeaderSize - uint16Size) / leafRecordSize
 )
 
@@ -80,12 +80,20 @@ func (page *BTreeLeafPage) Split() BTreeLeafPage {
 	return right
 }
 
+func (page *BTreeLeafPage) binarySize() int {
+	size := pageHeaderSize + uint16Size
+	for _, entry := range page.kv[:page.nkv] {
+		size += 2*uint16Size + int(entry.key.length) + int(entry.valueLength)
+	}
+	return size
+}
+
 // MarshalBinary encodes the header, record count, and records with separate key and value lengths.
 func (page BTreeLeafPage) MarshalBinary() ([]byte, error) {
 	if page.header.pageType != leafPageType || int(page.nkv) > len(page.kv) {
 		return nil, fmt.Errorf("invalid leaf page type %d or record count %d", page.header.pageType, page.nkv)
 	}
-	size := pageHeaderSize + uint16Size + int(page.nkv)*leafRecordSize
+	size := page.binarySize()
 	dst := page.header.appendBinary(make([]byte, 0, size))
 	dst = binary.BigEndian.AppendUint16(dst, page.nkv)
 	for _, entry := range page.kv[:page.nkv] {

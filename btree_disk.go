@@ -401,7 +401,7 @@ func (writer *diskPageWriter) changeInternal(offset uint64, block []byte, entry 
 		}
 	}
 	updated := pageChange{changed: true}
-	if int(page.nkey) == len(page.keys) {
+	if int(page.nkey) == len(page.keys) || page.binarySize() > diskPageSize {
 		sibling := page.Split()
 		updated.right, err = writer.writePage(sibling, sibling.keys[0])
 		if err != nil {
@@ -445,7 +445,7 @@ func (writer *diskPageWriter) changeLeaf(offset uint64, block []byte, entry KeyV
 		page.insertAt(pos+1, entry)
 	}
 	updated := pageChange{changed: true}
-	if int(page.nkv) == len(page.kv) {
+	if int(page.nkv) == len(page.kv) || page.binarySize() > diskPageSize {
 		sibling := page.Split()
 		updated.right, err = writer.writePage(sibling, sibling.kv[0].key)
 		if err != nil {

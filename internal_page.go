@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"cmp"
 	"encoding/binary"
 	"fmt"
@@ -9,10 +10,11 @@ import (
 )
 
 const (
-	maxKeySize          = 8
+	maxKeySize          = 16
+	intKeySize          = 8
 	uint16Size          = 2
 	pagePtrSize         = 8
-	internalRecordSize  = uint16Size + maxKeySize + pagePtrSize
+	internalRecordSize  = uint16Size + intKeySize + pagePtrSize
 	internalPageMaxKeys = (diskPageSize - pageHeaderSize - uint16Size) / internalRecordSize
 )
 
@@ -22,8 +24,8 @@ type KeyEntry struct {
 }
 
 func NewKeyEntryFromInt(key int64) KeyEntry {
-	entry := KeyEntry{length: maxKeySize}
-	binary.BigEndian.PutUint64(entry.data[:], uint64(key))
+	entry := KeyEntry{length: intKeySize}
+	binary.BigEndian.PutUint64(entry.data[maxKeySize-intKeySize:], uint64(key))
 	return entry
 }
 
@@ -37,9 +39,19 @@ func NewKeyEntryFromBytes(data []byte) (KeyEntry, error) {
 }
 
 func (key KeyEntry) compare(other KeyEntry) int {
+	keyLong, otherLong := key.length > intKeySize, other.length > intKeySize
+	if keyLong != otherLong {
+		if keyLong {
+			return 1
+		}
+		return -1
+	}
+	if keyLong {
+		return bytes.Compare(key.data[maxKeySize-key.length:], other.data[maxKeySize-other.length:])
+	}
 	// Preserve the order of existing integer keys and distinguish leading zero bytes.
-	left := int64(binary.BigEndian.Uint64(key.data[:]))
-	right := int64(binary.BigEndian.Uint64(other.data[:]))
+	left := int64(binary.BigEndian.Uint64(key.data[maxKeySize-intKeySize:]))
+	right := int64(binary.BigEndian.Uint64(other.data[maxKeySize-intKeySize:]))
 	if order := cmp.Compare(left, right); order != 0 {
 		return order
 	}
@@ -122,6 +134,14 @@ func (page *BTreeInternalPage) Split() BTreeInternalPage {
 	return right
 }
 
+func (page *BTreeInternalPage) binarySize() int {
+	size := pageHeaderSize + uint16Size
+	for _, key := range page.keys[:page.nkey] {
+		size += uint16Size + int(key.length) + pagePtrSize
+	}
+	return size
+}
+
 // MarshalBinary encodes the header, key count, length-prefixed keys, and child offsets.
 func (page BTreeInternalPage) MarshalBinary() ([]byte, error) {
 	if page.header.pageType != internalPageType {
@@ -130,7 +150,7 @@ func (page BTreeInternalPage) MarshalBinary() ([]byte, error) {
 	if int(page.nkey) > len(page.keys) {
 		return nil, fmt.Errorf("internal page key count %d exceeds %d", page.nkey, len(page.keys))
 	}
-	size := pageHeaderSize + uint16Size + int(page.nkey)*internalRecordSize
+	size := page.binarySize()
 	dst := page.header.appendBinary(make([]byte, 0, size))
 	dst = binary.BigEndian.AppendUint16(dst, page.nkey)
 	for _, key := range page.keys[:page.nkey] {

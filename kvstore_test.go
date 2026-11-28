@@ -69,18 +69,18 @@ func TestKVPersistsDistinctByteKeysAndValidatesSizes(t *testing.T) {
 	for i, key := range [][]byte{nil, {0}, {0, 0}, {1}, {0, 1}, {0xff}} {
 		requireKV(t, db, key, []byte{0, byte(i), 0}, true)
 	}
-	tooLong := []byte("123456789")
+	tooLong := make([]byte, maxKeySize+1)
 	if err := db.Set(tooLong, nil); err == nil {
-		t.Fatal("Set accepted a key longer than eight bytes")
+		t.Fatal("Set accepted an oversized key")
 	}
 	if err := db.Set([]byte{1}, make([]byte, maxValueSize+1)); err == nil {
 		t.Fatal("Set accepted an oversized value")
 	}
 	if _, _, err := db.Get(tooLong); err == nil {
-		t.Fatal("Get accepted a key longer than eight bytes")
+		t.Fatal("Get accepted an oversized key")
 	}
 	if _, err := db.Del(tooLong); err == nil {
-		t.Fatal("Del accepted a key longer than eight bytes")
+		t.Fatal("Del accepted an oversized key")
 	}
 	requireKV(t, db, []byte{1}, []byte{0, 3, 0}, true)
 	maxValue := bytes.Repeat([]byte{0, 255}, maxValueSize/2)
